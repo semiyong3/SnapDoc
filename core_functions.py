@@ -14,7 +14,7 @@ from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter 
 from PIL import Image, ImageGrab, ImageChops
 from pynput.keyboard import Key, Controller 
-from win32com.client import Dispatch
+from win32com.client import Dispatch, GetActiveObject
 import hashlib
 from common import _get_file_hash, capture_active_window
 
@@ -193,7 +193,7 @@ def capture_excel_sheets(target_file, output_dir, base_filename):
         if hwnd:
             win32gui.ShowWindow(hwnd, win32con.SW_SHOWMAXIMIZED)
             win32gui.SetForegroundWindow(hwnd)
-            time.sleep(0.5)
+            time.sleep(1.0)
         else:
             raise Exception("Excel 윈도우 핸들을 찾을 수 없습니다. (클래스: XLMAIN)")
 
@@ -237,11 +237,13 @@ def capture_word_document(target_file, output_dir, base_filename):
     document = None
     page_count = 0
     prev_file_hash = None
-    # keyboard = Controller() # [수정] pynput 제거
 
     # Word VBA 상수 정의
     wdGoToPage = 1
     wdGoToNext = 2
+    wdPrintView = 3          # '인쇄 모양' 보기
+    wdRevisionsViewFinal = 0 # '최종본' 보기 (변경 내용/메모 숨기기)
+    wdWindowStateMaximize = 1  # 창 최대화 상수
 
     try:
         print("[DEBUG] 1. Word Dispatch 및 Open 시도...")
@@ -251,35 +253,70 @@ def capture_word_document(target_file, output_dir, base_filename):
         document = word.Documents.Open(file_path)
         print("[DEBUG] 1. Open 성공.")
 
+        print("[DEBUG] 1b. Word 윈도우 핸들('OpusApp') 탐색 시작...")
+
         hwnd = win32gui.FindWindow("OpusApp", None)
         if hwnd:
-            win32gui.ShowWindow(hwnd, win32con.SW_SHOWMAXIMIZED)
-            win32gui.SetForegroundWindow(hwnd)
-            time.sleep(1.0) 
-        else:
-            raise Exception("Word 윈도우 핸들을 찾을 수 없습니다. (클래스: OpusApp)")
+            print(f"[DEBUG] 1c. 윈도우 핸들 탐색 성공: {hwnd}")
 
+            # 1. (복원) 최소화 상태일 수 있으므로 '복원'
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOWMAXIMIZED)
+            word.Application.WindowState = wdWindowStateMaximize
+            """
+            # 2. (위치 강제) 크기 변경 없이 (0,0)으로 '이동'
+            flags = win32con.SWP_SHOWWINDOW | win32con.SWP_NOSIZE
+            win32gui.SetWindowPos(hwnd, -1, 0, 0, 0, 0, flags) 
+            time.sleep(0.5) # 위치 이동 대기
+
+            # 3. (최대화) COM 속성으로 최대화 *요청*
+            word.Application.WindowState = wdWindowStateMaximize
+            """
+            # 4. (대기) *[중요]* Word가 최대화를 '완료'할 시간을 줍니다.
+            print("[DEBUG] 1d. Word 창 최대화 대기 (1.5초)...")
+            time.sleep(1.5)
+            
+            # 5. (포커스) *최대화가 완료된 후* 포커스를 설정합니다.
+            win32gui.SetForegroundWindow(hwnd)
+            time.sleep(0.5)
+            
+            rect = win32gui.GetWindowRect(hwnd)
+            print(f"[DEBUG] 1e. 창 최대화 및 포커스 완료. 현재 좌표: {rect}")
+            # --- [수정 끝] ---
+
+        else:
+            raise Exception("Word 윈도우 핸들('OpusApp')을 찾지 못했습니다.")
+
+        # --- [핵심 수정 2: 보기 모드 설정을 최대화 *이후*에 실행] ---
         try:
-            print("[DEBUG] 2. '한 페이지' 보기 모드로 변경 시도...")
+            # *[중요]* 이 작업은 창이 '완전히' 최대화된 후에 실행되어야 합니다.
+            print("[DEBUG] 2. '인쇄 모양' 및 '한 페이지' 보기 모드로 변경 시도...")
+            word.ActiveWindow.View.Type = wdPrintView 
+            time.sleep(0.5) 
+            word.ActiveWindow.View.RevisionsView = wdRevisionsViewFinal
+            time.sleep(0.5) 
+            
+            # '한 페이지' 보기를 '최대화된 창' 크기에 맞춥니다.
             word.ActiveWindow.View.Zoom.PageFit = 1 
             print("[DEBUG] 2. 보기 모드 변경 성공.")
         except Exception as e:
             print(f"[WARN] 보기 모드 변경 실패 (오류: {e})")
+        # --- [수정 끝] ---
             
-        print("[DEBUG] Word 페이지 캡처 루프 시작 (파일 해시 비교 방식)...")
-        
+        print("[DEBUG] Word 페이지 캡처 루프 시작 (파일 해시 비교 방식)...")        
         for i in range(1, 501): # 최대 500페이지
             
             print(f"[DEBUG] Word Page-{i} 캡처 시도...")
             try:
-                # [수정] 캡처 직전 포커스 보장
+                # 캡처 직전 포커스 재확보
                 win32gui.SetForegroundWindow(hwnd)
-                time.sleep(0.2) # 포커스 이동 대기
+                time.sleep(0.2) 
                 screenshot = capture_active_window(hwnd)
+                print(f"[DEBUG] Window Handle = {hwnd}")
             except Exception as capture_err:
                 print(f"[WARN] 캡처 실패(오류: {capture_err}). 루프를 중단합니다.")
                 break
-            
+
             output_file_path = os.path.join(output_path, f"{base_filename}_page_{i:03}.png")
             screenshot.save(output_file_path, "PNG")
             
@@ -289,32 +326,24 @@ def capture_word_document(target_file, output_dir, base_filename):
 
             if i > 1 and prev_file_hash == current_file_hash:
                 print(f"[DEBUG] Page-{i}가 이전 페이지와 파일 해시가 동일하여 캡처를 중지합니다 (문서 끝).")
-                # [수정] PDF와 동일하게 중복 파일 삭제 로직으로 변경
                 try:
                     os.remove(output_file_path)
                     print(f"[DEBUG] 중복 저장된 {output_file_path} 파일을 삭제했습니다.")
                 except Exception as e:
                     print(f"[WARN] 중복 파일 삭제 실패: {e}")
-                break # 루프 중단
+                break 
             
             prev_file_hash = current_file_hash
             page_count += 1
             print(f"[DEBUG] Word Page-{i} 캡처 및 저장 완료.")
             
-            # --- [핵심 수정] ---
-            # 5. PageDown 키 전송 대신, Word COM API로 페이지 이동
             print(f"[DEBUG] COM API로 다음 페이지 이동 시도 (GoTo Page Next)...")
             try:
-                # Selection.GoTo(What, Which, Count, Name)
-                # What=wdGoToPage(1), Which=wdGoToNext(2)
                 document.Application.Selection.GoTo(wdGoToPage, wdGoToNext) 
-                time.sleep(1.0) # 페이지 렌더링 대기 (넉넉하게 1초)
+                time.sleep(2.0)
             except Exception as e:
-                # COM 오류 발생 시 (예: 문서 끝 도달)
                 print(f"[DEBUG] COM API 페이지 이동 실패 (문서 끝 추정: {e}). 루프를 중단합니다.")
                 break
-            # --- [수정 끝] ---
-
     except Exception as e:
         raise RuntimeError(f"Word 변환 중 오류 발생: {e}")
 
